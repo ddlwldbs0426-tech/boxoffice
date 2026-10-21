@@ -1,296 +1,333 @@
 
 import streamlit as st
 import requests
+import pandas as pd
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import xml.etree.ElementTree as ET
+import json
 
-# 1. 페이지 기본 설정
+# ==========================================
+# 1. 화면 설정
+# ==========================================
 st.set_page_config(
     page_title="어제의 박스오피스",
     page_icon="🎬",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("🎬 어제의 박스오피스")
-st.caption("영화진흥위원회(KOBIS) 일별 박스오피스 · 한국 시간 기준")
+st.caption("영화진흥위원회(KOBIS) 일별 박스오피스 API")
 
+# ==========================================
 # 2. 한국 시간 기준으로 어제 날짜 계산
-KST = ZoneInfo("Asia/Seoul")
-yesterday = datetime.now(KST).date() - timedelta(days=1)
-target_dt = yesterday.strftime("%Y%m%d")
-
-
-# 3. API에서 받은 숫자 문자열을 정수로 변환하는 함수
-def to_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-# 4. JSON 응답을 우선 처리하고, XML 응답도 확인하는 함수
-def parse_response(response):
-    try:
-        return response.json(), None
-    except ValueError:
-        pass
-
-    try:
-        root = ET.fromstring(response.text)
-        result = {}
-
-        # 인증키 오류 등 API 오류 정보 확인
-        fault = root.find(".//faultInfo")
-        if fault is not None:
-            result["faultInfo"] = {
-                child.tag: child.text for child in list(fault)
-            }
-
-        # XML 형식의 영화 목록 확인
-        box_result = root.find(".//boxOfficeResult")
-        if box_result is not None:
-            items = []
-            for movie in box_result.findall(".//dailyBoxOffice"):
-                items.append({
-                    child.tag: child.text
-                    for child in list(movie)
-                })
-            result["boxOfficeResult"] = {
-                "dailyBoxOfficeList": items
-            }
-
-        if result:
-            return result, None
-
-        return None, "응답을 JSON 또는 예상한 XML 형식으로 해석하지 못했습니다."
-
-    except ET.ParseError:
-        return None, "서버 응답이 JSON/XML 형식이 아닙니다."
-
-
-# 5. 인증키는 코드에 직접 쓰지 않고 Secrets에서 가져오기
+# ==========================================
 try:
-    api_key = st.secrets["KOBIS_KEY"]
+    korea_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    yesterday = korea_today - timedelta(days=1)
+    target_dt = yesterday.strftime("%Y%m%d")
+    display_date = yesterday.strftime("%Y년 %m월 %d일")
+except Exception as e:
+    st.error(f"날짜 계산 오류: {type(e).__name__}")
+    st.stop()
+
+st.write(f"**조회 기준일:** {display_date}")
+
+# ==========================================
+# 3. Secrets에서 인증키 읽기
+# ==========================================
+try:
+    api_key = str(st.secrets["KOBIS_KEY"]).strip()
+    if not api_key:
+        raise ValueError("인증키가 비어 있습니다.")
 except Exception:
     st.error(
-        "인증키를 찾을 수 없습니다. Streamlit Cloud의 "
-        "앱 설정에서 Settings → Secrets를 확인해 주세요."
+        "인증키를 읽을 수 없습니다. Streamlit Cloud의 "
+        "앱 설정 → Secrets에 다음 내용을 등록해 주세요."
     )
     st.code('KOBIS_KEY = "발급받은_인증키"', language="toml")
+    st.info("인증키를 코드나 공개 GitHub 저장소에 입력하지 마세요.")
     st.stop()
 
-if not str(api_key).strip():
-    st.error(
-        "KOBIS_KEY가 비어 있습니다. Secrets에 올바른 인증키를 입력해 주세요."
-    )
-    st.stop()
-
-
-# 6. KOBIS 일별 박스오피스 API 요청
-api_url = (
-    "https://www.kobis.or.kr/kobisopenapi/webservice/rest/"
+# ==========================================
+# 4. KOBIS API 요청 함수
+# ==========================================
+API_URL = (
+    "https://kobis.or.kr/kobisopenapi/webservice/rest/"
     "boxoffice/searchDailyBoxOfficeList.json"
 )
 
-params = {
-    "key": str(api_key).strip(),
-    "targetDt": target_dt
-}
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_box_office(api_key_value, date_value):
+    """API를 요청하고 영화 목록을 반환합니다."""
+    response = requests.get(
+        API_URL,
+        params={
+            "key": api_key_value,
+            "targetDt": date_value,
+        },
+        timeout=(5, 20),
+    )
 
-with st.spinner("박스오피스 데이터를 불러오는 중입니다..."):
+    response.raise_for_status()
+
     try:
-        response = requests.get(
-            api_url,
-            params=params,
-            timeout=20
+        data = response.json()
+    except (ValueError, json.JSONDecodeError) as e:
+        raise ValueError("API 응답이 JSON 형식이 아닙니다.") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("API 응답 구조가 올바르지 않습니다.")
+
+    # HTTP 상태 코드가 200이어도 API 오류일 수 있습니다.
+    if "faultInfo" in data:
+        fault = data.get("faultInfo") or {}
+        if not isinstance(fault, dict):
+            fault = {}
+
+        code = fault.get("errorCode", "확인 불가")
+        message = fault.get("message", "오류 메시지가 없습니다.")
+
+        raise RuntimeError(
+            f"KOBIS API 오류 ({code}): {message}"
         )
+
+    box_result = data.get("boxOfficeResult")
+
+    if not isinstance(box_result, dict):
+        raise ValueError(
+            "응답에 boxOfficeResult가 없습니다."
+        )
+
+    movies = box_result.get("dailyBoxOfficeList")
+
+    if not isinstance(movies, list):
+        raise ValueError(
+            "dailyBoxOfficeList가 목록 형식이 아닙니다."
+        )
+
+    return movies
+
+
+# ==========================================
+# 5. API 요청 및 오류 처리
+# ==========================================
+with st.spinner("박스오피스 정보를 불러오는 중입니다..."):
+    try:
+        movie_list = get_box_office(api_key, target_dt)
+
     except requests.exceptions.Timeout:
-        st.error("API 요청 시간이 초과되었습니다.")
+        st.error("KOBIS 서버 응답 시간이 초과되었습니다.")
+        st.info("잠시 후 다시 시도해 주세요.")
+        st.stop()
+
+    except requests.exceptions.HTTPError as e:
+        status = (
+            e.response.status_code
+            if e.response is not None
+            else "확인 불가"
+        )
+        st.error(f"KOBIS 서버 HTTP 오류: {status}")
+        st.info("API 주소와 서버 상태를 확인해 주세요.")
+        st.stop()
+
+    except requests.exceptions.ConnectionError:
+        st.error("KOBIS 서버에 연결하지 못했습니다.")
+        st.info("네트워크 연결 또는 KOBIS 서버 상태를 확인해 주세요.")
+        st.stop()
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"API 통신 오류: {type(e).__name__}")
+        st.info("잠시 후 다시 시도해 주세요.")
+        st.stop()
+
+    except RuntimeError as e:
+        st.error(str(e))
         st.info(
-            "잠시 후 다시 실행하거나 인터넷 연결 및 "
-            "KOBIS 서버 상태를 확인해 주세요."
+            "Secrets의 KOBIS_KEY가 정확한지, "
+            "인증키가 정상적으로 발급되었는지 확인해 주세요."
         )
         st.stop()
 
-    except requests.exceptions.RequestException as exc:
-        st.error("API 서버에 연결하지 못했습니다.")
-        st.info(
-            "인터넷 연결, API 주소 또는 서버 상태를 확인해 주세요."
-        )
-        st.caption(f"세부 정보: {exc}")
+    except ValueError as e:
+        st.error(str(e))
+        st.info("KOBIS API 응답 구조를 확인해 주세요.")
         st.stop()
 
+    except Exception as e:
+        st.error(f"예상하지 못한 오류: {type(e).__name__}")
+        st.info(
+            "Streamlit Cloud의 Manage app → Logs에서 "
+            "자세한 오류 내용을 확인해 주세요."
+        )
+        st.stop()
 
-# 7. HTTP 상태 코드 확인
-if response.status_code != 200:
-    st.error(
-        f"API 요청 실패: HTTP 상태 코드 {response.status_code}"
-    )
-    st.info(
-        "API 주소, 네트워크 연결 및 KOBIS 서버 상태를 확인해 주세요."
-    )
-    st.stop()
-
-
-# 8. 응답 내용 해석
-data, parse_error = parse_response(response)
-
-if parse_error:
-    st.error("API 응답을 읽지 못했습니다.")
-    st.info(
-        f"{parse_error} API 주소와 서버 응답 형식을 확인해 주세요."
-    )
-    st.stop()
-
-
-# 9. 상태 코드가 200이어도 API 자체 오류가 있는지 확인
-fault_info = data.get("faultInfo") if isinstance(data, dict) else None
-
-if fault_info:
-    fault_code = fault_info.get("errorCode", "알 수 없음")
-    fault_message = fault_info.get(
-        "message",
-        "오류 메시지가 제공되지 않았습니다."
-    )
-
-    st.error("KOBIS API에서 오류를 반환했습니다.")
-    st.write(f"오류 코드: {fault_code}")
-    st.write(f"오류 내용: {fault_message}")
-    st.info(
-        "인증키가 정확한지, API 이용 신청 및 이용 상태에 "
-        "문제가 없는지 확인해 주세요."
-    )
-    st.stop()
-
-
-# 10. 박스오피스 결과와 영화 목록 확인
-box_result = (
-    data.get("boxOfficeResult")
-    if isinstance(data, dict)
-    else None
-)
-
-if not isinstance(box_result, dict):
-    st.error("응답에 boxOfficeResult가 없습니다.")
-    st.info(
-        "KOBIS API 요청 주소와 응답 형식을 확인해 주세요."
-    )
-    st.stop()
-
-movie_list = box_result.get("dailyBoxOfficeList", [])
-
-if not isinstance(movie_list, list) or len(movie_list) == 0:
+# ==========================================
+# 6. 영화 목록이 비어 있는 경우
+# ==========================================
+if len(movie_list) == 0:
     st.warning(
-        f"{yesterday.strftime('%Y년 %m월 %d일')}의 영화 목록이 비어 있습니다."
+        f"{display_date}의 박스오피스 목록이 비어 있습니다."
     )
     st.info(
         "해당 날짜의 집계 자료가 아직 제공되지 않았거나 "
-        "데이터가 없을 수 있습니다. 조회 날짜와 KOBIS "
-        "서비스 상태를 확인한 뒤 다시 시도해 주세요."
+        "API가 빈 목록을 반환했을 수 있습니다. "
+        "조회 날짜와 KOBIS 홈페이지의 자료를 확인해 주세요."
     )
     st.stop()
 
+# ==========================================
+# 7. 데이터 정리
+# ==========================================
+df = pd.DataFrame(movie_list)
 
-# 11. 영화 정보를 정리하고 문자열 숫자를 정수로 변환
-movies = []
+required_columns = [
+    "rank",
+    "movieNm",
+    "openDt",
+    "audiCnt",
+    "audiAcc",
+    "scrnCnt",
+]
 
-for item in movie_list:
-    movies.append({
-        "순위": to_int(item.get("rank")),
-        "영화명": item.get("movieNm") or "영화명 없음",
-        "개봉일": item.get("openDt") or "-",
-        "관객수": to_int(item.get("audiCnt")),
-        "누적관객": to_int(item.get("audiAcc")),
-        "스크린수": to_int(item.get("scrnCnt")),
-        "상영횟수": to_int(item.get("showCnt")),
-        "순위 증감": to_int(item.get("rankInten"))
-    })
+missing = [
+    col for col in required_columns
+    if col not in df.columns
+]
 
-movies.sort(key=lambda movie: movie["순위"])
+if missing:
+    st.error(
+        "API 응답에서 필요한 항목이 누락되었습니다: "
+        + ", ".join(missing)
+    )
+    st.info("KOBIS API 응답 형식을 확인해 주세요.")
+    st.stop()
 
-top_movie = movies[0]
+# API 숫자는 문자열로 오므로 숫자형으로 변환합니다.
+numeric_columns = [
+    "rank",
+    "audiCnt",
+    "audiAcc",
+    "scrnCnt",
+]
 
+for col in numeric_columns:
+    df[col] = pd.to_numeric(
+        df[col], errors="coerce"
+    )
 
-# 12. 조회 날짜와 1위 영화의 지표 카드 표시
-st.subheader(
-    f"📅 {yesterday.strftime('%Y년 %m월 %d일')} 박스오피스"
+df = df.dropna(
+    subset=["rank", "audiCnt"]
+).copy()
+
+if df.empty:
+    st.error("순위나 관객 수를 숫자로 읽을 수 없습니다.")
+    st.stop()
+
+for col in numeric_columns:
+    df[col] = df[col].fillna(0).astype(int)
+
+df["movieNm"] = (
+    df["movieNm"]
+    .fillna("영화명 정보 없음")
+    .astype(str)
 )
 
-st.caption(
-    "관객수는 해당 날짜의 관객 수이며, "
-    "누적관객은 개봉 이후 누적 관객 수입니다."
-)
+df["openDt"] = df["openDt"].fillna("").astype(str)
 
-st.markdown(f"### 🏆 1위: {top_movie['영화명']}")
+df = df.sort_values("rank").reset_index(drop=True)
+
+# ==========================================
+# 8. 1위 영화 지표 카드 세 장
+# ==========================================
+first = df.iloc[0]
+
+st.subheader("🏆 일별 박스오피스 1위")
+st.markdown(f"### {first['movieNm']}")
 
 card1, card2, card3 = st.columns(3)
 
 card1.metric(
-    "일일 관객수",
-    f"{top_movie['관객수']:,}명"
+    "일일 관객 수",
+    f"{first['audiCnt']:,}명",
 )
 
 card2.metric(
-    "누적 관객수",
-    f"{top_movie['누적관객']:,}명"
+    "누적 관객 수",
+    f"{first['audiAcc']:,}명",
 )
 
 card3.metric(
     "스크린 수",
-    f"{top_movie['스크린수']:,}개"
+    f"{first['scrnCnt']:,}개",
 )
 
+# ==========================================
+# 9. 전체 영화 순위 표
+# ==========================================
+st.subheader("📋 전체 박스오피스 순위")
 
-# 13. 전체 영화 순위를 표로 표시
-st.subheader("전체 순위")
+table = df[
+    [
+        "rank",
+        "movieNm",
+        "openDt",
+        "audiCnt",
+        "audiAcc",
+        "scrnCnt",
+    ]
+].copy()
 
-display_rows = []
-
-for movie in movies:
-    display_rows.append({
-        "순위": movie["순위"],
-        "영화명": movie["영화명"],
-        "개봉일": movie["개봉일"],
-        "관객수": f"{movie['관객수']:,}",
-        "누적관객": f"{movie['누적관객']:,}",
-        "스크린수": f"{movie['스크린수']:,}"
-    })
-
-st.dataframe(
-    display_rows,
-    use_container_width=True,
-    hide_index=True
-)
-
-
-# 14. 관객수 기준 상위 5편을 막대그래프로 표시
-st.subheader("📊 관객수 상위 5편")
-
-top_five = sorted(
-    movies,
-    key=lambda movie: movie["관객수"],
-    reverse=True
-)[:5]
-
-chart_rows = [
-    {
-        "영화명": movie["영화명"],
-        "관객수": movie["관객수"]
-    }
-    for movie in top_five
+table.columns = [
+    "순위",
+    "영화명",
+    "개봉일",
+    "관객수",
+    "누적관객",
+    "스크린수",
 ]
 
+table["개봉일"] = table["개봉일"].replace(
+    "", "정보 없음"
+)
+
+for col in ["관객수", "누적관객", "스크린수"]:
+    table[col] = table[col].map(
+        lambda value: f"{value:,}"
+    )
+
+table["순위"] = table["순위"].astype(int).astype(str)
+
+st.dataframe(
+    table,
+    use_container_width=True,
+    hide_index=True,
+)
+
+# ==========================================
+# 10. 관객 수 상위 5편 막대그래프
+# ==========================================
+st.subheader("📊 관객 수 상위 5편")
+
+top5 = (
+    df.nlargest(5, "audiCnt")
+    .sort_values("audiCnt", ascending=True)
+)
+
+chart = top5.set_index("movieNm")[["audiCnt"]]
+chart = chart.rename(columns={"audiCnt": "관객 수"})
+
 st.bar_chart(
-    chart_rows,
-    x="영화명",
-    y="관객수",
-    horizontal=True
+    chart,
+    use_container_width=True,
 )
 
-
-# 15. 자료 출처와 조회 기준일 표시
+# ==========================================
+# 11. 자료 안내 및 새로고침
+# ==========================================
 st.caption(
-    "자료: 영화진흥위원회(KOBIS) 일별 박스오피스 Open API"
+    "자료: 영화진흥위원회(KOBIS) 일별 박스오피스 API"
 )
-st.caption(f"조회 기준일: {target_dt}")
+
+if st.button("🔄 최신 자료 다시 불러오기"):
+    st.cache_data.clear()
+    st.rerun()
